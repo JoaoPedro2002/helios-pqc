@@ -34,6 +34,8 @@ ELECTION_SET_REG="election@set-reg"
 ELECTION_SET_FEATURED="election@set-featured"
 ELECTION_SAVE_QUESTIONS="election@save-questions"
 ELECTION_REGISTER="election@register"
+ELECTION_REGISTER_LBVS="election@register-lbvs"
+ELECTION_LBVS_INSTANCE="election@lbvs-instance"
 ELECTION_FREEZE="election@freeze"
 
 ELECTION_COMPUTE_TALLY="election@compute-tally"

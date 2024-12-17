@@ -14,6 +14,9 @@ import uuid
 import bleach
 from django.conf import settings
 from django.db import models, transaction
+from lbvs_lib.return_code_table import ReturnCodeTable
+from lbvs_lib.scheme_algorithms import setup, register
+from lbvs_lib.serializers import serialize_pk, deserialize_pk, serialize_vvk, serialize_vck
 from validate_email import validate_email
 
 from helios import datatypes
@@ -142,6 +145,9 @@ class Election(HeliosModel):
 
   # downloadable election info
   election_info_url = models.CharField(max_length=300, null=True)
+  # election method (simple, pqc)
+  ELECTION_METHODS = (("simple", "Simple"), ("quantum-safe", "Quantum-Safe"))
+  election_method = models.CharField(max_length=250, default="simple", null=False, choices=ELECTION_METHODS)
 
   class Meta:
     app_label = 'helios'
@@ -153,7 +159,8 @@ class Election(HeliosModel):
       'help_email': self.help_email or 'help@heliosvoting.org',
       'private_p': self.private_p,
       'use_advanced_audit_features': self.use_advanced_audit_features,
-      'randomize_answer_order': self.randomize_answer_order
+      'randomize_answer_order': self.randomize_answer_order,
+      'is_quantum_safe': self.is_quantum_safe
       }
 
   @property
@@ -535,10 +542,17 @@ class Election(HeliosModel):
     self.set_eligibility()
 
     # public key for trustees
-    trustees = list(Trustee.get_by_election(self))
-    combined_pk = trustees[0].public_key
-    for t in trustees[1:]:
-      combined_pk = combined_pk * t.public_key
+    if self.is_quantum_safe:
+      pk, dk, ck = setup()
+      bb = BallotBox.get_by_election(self)
+      bb.freeze(public_key=pk)
+      bb.send_keys(public_key=pk, decryption_key=dk, code_key=ck)
+
+    else:
+      trustees = list(Trustee.get_by_election(self))
+      combined_pk = trustees[0].public_key
+      for t in trustees[1:]:
+        combined_pk = combined_pk * t.public_key
 
     self.public_key = combined_pk
 
@@ -677,6 +691,10 @@ class Election(HeliosModel):
       prettified_result.append({'question': q['short_name'], 'answers': pretty_question})
 
     return prettified_result
+
+  @property
+  def is_quantum_safe(self):
+    return self.election_method in Election.ELECTION_METHODS[1]
 
 
 class ElectionLog(models.Model):
@@ -1214,3 +1232,109 @@ class Trustee(HeliosModel):
     """
     # verify_decryption_proofs(self, decryption_factors, decryption_proofs, public_key, challenge_generator):
     return self.election.encrypted_tally.verify_decryption_proofs(self.decryption_factors, self.decryption_proofs, self.public_key, algs.EG_fiatshamir_challenge_generator)
+
+
+# PQC Models
+
+class BallotBox(HeliosModel):
+    uuid = models.CharField(max_length=50, null=False)
+    election = models.ForeignKey(Election, on_delete=models.CASCADE)
+    public_key = JSONField(null=True)
+
+    return_code_server_url = models.CharField(max_length=500, null=False)
+    shuffle_server_url = models.CharField(max_length=500, null=False)
+    auditors_urls = JSONField(null=False)
+
+    prf_key = models.CharField(max_length=500, null=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @classmethod
+    def setup_from_election(cls, election, return_code_server_url, shuffle_server_url, auditors_urls):
+        bb_uuid = str(uuid.uuid4())
+        bb = BallotBox(election=election, uuid=bb_uuid,
+                       return_code_server_url=return_code_server_url,
+                       shuffle_server_url=shuffle_server_url,
+                       auditors_urls=auditors_urls)
+        bb.save()
+        return bb
+
+    def freeze(self, public_key):
+        if isinstance(public_key, dict):
+            self.public_key = public_key
+        else:
+            self.public_key = serialize_pk(public_key)
+        self.save()
+
+    def send_keys(self, decryption_key, code_key):
+        instance = self.get_election_instance()
+        import requests
+        for url in self.auditors_urls:
+            requests.post(url + "/auditor/setup", json={
+                "instance": instance,
+            })
+        requests.post(self.shuffle_server_url + "/shuffler/setup", json={
+            "instance": instance,
+            'dk': decryption_key,
+        })
+        resp = requests.post(self.return_code_server_url + "/code/setup", json={
+            "instance": instance,
+            'ck': code_key,
+        })
+        self.prf_key = resp.json()["key"]
+        self.save()
+
+    def get_election_instance(self) -> dict:
+        return {
+            "pk": self.public_key,
+            "auditors_urls": self.auditors_urls,
+            "shuffle_server_url": self.shuffle_server_url,
+            "return_code_server_url": self.return_code_server_url,
+            "ballot_box_url": settings.SECURE_URL_HOST,
+            "ballot_box_uuid": self.uuid,
+            "election_uuid": self.election.uuid,
+            # "prf_key": self.prf_key,
+        }
+
+    @classmethod
+    def get_by_election(cls, election):
+        try:
+            return cls.objects.get(election=election)
+        except cls.DoesNotExist:
+            return None
+
+
+class LbvsVoter(HeliosModel):
+  uuid = models.CharField(max_length=50, null=False)
+  voter = models.ForeignKey(Voter, on_delete=models.CASCADE)
+  vote = JSONField(null=True)
+
+  vvk = JSONField(null=True)
+
+  @classmethod
+  def register(cls, voter):
+    import requests
+
+    ballot_box = BallotBox.get_by_election(voter.election)
+    prf_key = requests.get(ballot_box.return_code_server_url + "/code/key")
+    pk = deserialize_pk(ballot_box.public_key)
+
+    vvk, vck, f = register(pk)
+    vvk_serialized = serialize_vvk(vvk)
+    vck_serialized = serialize_vck(vck)
+
+    rct = [ReturnCodeTable.compute_table(prf_key["key"], vck[0], question, b64=True)
+           for question in voter.election.questions]
+
+    uuid_voter = str(uuid.uuid4())
+    lbvs_voter = LbvsVoter(uuid=uuid_voter, voter=voter, vote=None, vvk=vvk_serialized)
+
+    lbvs_voter.save()
+
+    # TODO cleanup
+    return lbvs_voter, vvk_serialized, vck_serialized, rct
+
+  @classmethod
+  def get_by_voter(cls, voter):
+    return cls.objects.get(voter=voter)

@@ -68,6 +68,8 @@ urlpatterns = [
     path('/set_featured', views.one_election_set_featured, name=names.ELECTION_SET_FEATURED),
     path('/save_questions', views.one_election_save_questions, name=names.ELECTION_SAVE_QUESTIONS),
     path('/register', views.one_election_register, name=names.ELECTION_REGISTER),
+    path('/register_lbvs', views.one_election_lbvs_register, name=names.ELECTION_REGISTER_LBVS),
+    path('/lbvs_instance', views.one_election_lbvs_instance, name=names.ELECTION_LBVS_INSTANCE),
     path('/freeze', views.one_election_freeze, name=names.ELECTION_FREEZE), # includes freeze_2 as POST target
     
     # computing tally

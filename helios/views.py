@@ -12,6 +12,7 @@ import os
 import uuid
 from urllib.parse import urlencode
 
+import requests
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db import transaction, IntegrityError
@@ -29,7 +30,7 @@ from . import forms
 from . import tasks
 from .crypto import algs, electionalgs, elgamal
 from .crypto import utils as cryptoutils
-from .models import User, Election, CastVote, Voter, VoterFile, Trustee, AuditedBallot
+from .models import User, Election, CastVote, Voter, VoterFile, Trustee, AuditedBallot, BallotBox, LbvsVoter
 from .security import (election_view, election_admin,
                        trustee_check, set_logged_in_trustee,
                        can_create_election, user_can_see_election, get_voter,
@@ -213,9 +214,19 @@ def election_new(request):
         user = get_user(request)
         election_params['admin'] = user
         try:
-          election = Election.objects.create(**election_params)
-          election.generate_trustee(ELGAMAL_PARAMS)
-          return HttpResponseRedirect(settings.SECURE_URL_HOST + reverse(url_names.election.ELECTION_VIEW, args=[election.uuid]))
+          with transaction.atomic():
+            ballot_box_params = {
+              'return_code_server_url': election_params.pop('return_code_server_url'),
+              'shuffle_server_url': election_params.pop('shuffle_server_url'),
+              'auditors_urls': election_params.pop('auditors_urls').split(','),
+            }
+
+            election = Election.objects.create(**election_params)
+            if election.is_quantum_safe:
+              BallotBox.setup_from_election(election, **ballot_box_params)
+            else:
+              election.generate_trustee(ELGAMAL_PARAMS)
+            return HttpResponseRedirect(settings.SECURE_URL_HOST + reverse(url_names.election.ELECTION_VIEW, args=[election.uuid]))
         except IntegrityError:
           error = "An election with short name %s already exists" % election_params['short_name']
       else:
@@ -1016,6 +1027,60 @@ def one_election_register(request, election):
     voter = _register_voter(election, user)
     
   return HttpResponseRedirect(settings.SECURE_URL_HOST + reverse(url_names.election.ELECTION_VIEW, args=[election.uuid]))
+
+
+@election_view()
+@return_json
+def one_election_lbvs_register(request, election):
+  """
+  register to vote for lbvs
+  """
+  # TODO better error handling
+  if not election.openreg or not election.is_quantum_safe or not election.frozen_at:
+        raise PermissionDenied
+
+
+  user = get_user(request)
+  if not user:
+    raise PermissionDenied
+
+  voter = Voter.get_by_election_and_user(election, user)
+
+  if voter:
+    raise PermissionDenied
+
+  voter = _register_voter(election, user)
+  lbvs_voter, vvk_serialized, vck_serialized, rct  = LbvsVoter.register(voter)
+
+  voter_registration = {
+    'voter_uuid': lbvs_voter.uuid,
+    'voter_email': voter.voter_email,
+    'vvk': vvk_serialized,
+    'election_uuid': election.uuid,
+  }
+
+  url = f"{BallotBox.get_by_election(election).return_code_server_url}/code/register"
+  requests.post(url, json=voter_registration)
+
+  return {
+    'voter': lbvs_voter.toJSONDict(),
+    'vvk': vvk_serialized,
+    'vck': vck_serialized,
+    'rct': rct
+  }
+
+@election_view()
+@return_json
+def one_election_lbvs_instance(request, election):
+  """
+  get lbvs instance
+  """
+  if not election.is_quantum_safe:
+    raise PermissionDenied
+
+  bb = BallotBox.get_by_election(election)
+
+  return bb.get_election_instance()
 
 @election_admin(frozen=False)
 def one_election_save_questions(request, election):

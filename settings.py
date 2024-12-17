@@ -44,7 +44,11 @@ SHOW_USER_INFO = (get_from_env('SHOW_USER_INFO', '1') == '1')
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'helios',
+        'NAME': get_from_env("DB_NAME", "helios"),
+        'USER': get_from_env("DB_USER", "helios"),
+        'PASSWORD': get_from_env("DB_PASSWORD", "helios"),
+        'HOST': get_from_env("DB_HOST", "localhost"),
+        'PORT': get_from_env("DB_PORT", "5432"),
         'CONN_MAX_AGE': 600,
     },
 }
@@ -221,7 +225,7 @@ AUTH_TEMPLATE_BASE = "server_ui/templates/base.html"
 HELIOS_TEMPLATE_BASE = "server_ui/templates/base.html"
 HELIOS_ADMIN_ONLY = False
 HELIOS_VOTERS_UPLOAD = True
-HELIOS_VOTERS_EMAIL = True
+HELIOS_VOTERS_EMAIL = get_from_env('HELIOS_VOTERS_EMAIL', '0') == '1'
 
 # are elections private by default?
 HELIOS_PRIVATE_DEFAULT = False
