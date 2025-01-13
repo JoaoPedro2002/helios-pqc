@@ -185,7 +185,9 @@ Once you do this, the tally will visible to you, the administrator, only.
 {% else %}
 
 {% if election.voting_has_started %}
+{% if not election.is_quantum_safe %}
 <a class="button" href="{{test_cookie_url}}">Vote in this {{election.election_type}} </a>
+{% endif %}
 <br />
 <br />
 {% if election.voting_extended_until %}
