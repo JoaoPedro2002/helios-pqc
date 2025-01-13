@@ -208,18 +208,18 @@ if __name__ == "__main__":
 
     params = {
         "answers_tests": [8],
-        "voters_tests": [2**14],
-        "n_executions": 1,
+        "voters_tests": [2**i for i in range(4, 9, 2)],
+        "n_executions": 3,
     }
 
     tests = {
-        "shuffle": False,
-        "prf": False,
-        "helios": False,
+        "shuffle": True,
+        "prf": True,
+        "helios": True,
         "lbvs": True,
-        "algorithms": False,
+        "algorithms": True,
         "shuffle_proof": False,
-        "register_with_rct": False,
+        "register_with_rct": True,
     }
 
     for test_name, value in tests.items():
