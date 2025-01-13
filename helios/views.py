@@ -7,6 +7,7 @@ Ben Adida (ben@adida.net)
 
 import base64
 import datetime
+import json
 import logging
 import os
 import uuid
@@ -16,7 +17,7 @@ import requests
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db import transaction, IntegrityError
-from django.http import HttpResponse, Http404, HttpResponseRedirect, HttpResponseForbidden
+from django.http import HttpResponse, Http404, HttpResponseRedirect, HttpResponseForbidden, JsonResponse
 from django.urls import reverse
 
 import helios_auth.url_names as helios_auth_urls
@@ -630,8 +631,12 @@ def one_election_cast_confirm(request, election):
   user = get_user(request)    
 
   # if no encrypted vote, the user is reloading this page or otherwise getting here in a bad way
-  if ('encrypted_vote' not in request.session) or request.session['encrypted_vote'] is None:
+  if election.is_quantum_safe:
+    encrypted_vote = request.body
+  elif ('encrypted_vote' not in request.session) or request.session['encrypted_vote'] is None:
     return HttpResponseRedirect(settings.URL_HOST)
+  else:
+    encrypted_vote = request.session['encrypted_vote']
 
   # election not frozen or started
   if not election.voting_has_started():
@@ -641,18 +646,26 @@ def one_election_cast_confirm(request, election):
   
   # auto-register this person if the election is openreg
   if user and not voter and election.openreg:
+    if election.is_quantum_safe:
+      pass
+      # TODO: registration in cast
     voter = _register_voter(election, user)
+
     
   # tallied election, no vote casting
   if election.encrypted_tally or election.result:
     return render_template(request, 'election_tallied', {'election': election})
-    
-  encrypted_vote = request.session['encrypted_vote']
+
   vote_fingerprint = cryptoutils.hash_b64(encrypted_vote)
 
   # if this user is a voter, prepare some stuff
   if voter:
-    vote = datatypes.LDObject.fromDict(utils.from_json(encrypted_vote), type_hint='legacy/EncryptedVote').wrapped_obj
+    if election.is_quantum_safe:
+        param_name = "generic_vote"
+        vote = json.loads(encrypted_vote)['questions']
+    else:
+      param_name = "vote"
+      vote = datatypes.LDObject.fromDict(utils.from_json(encrypted_vote), type_hint='legacy/EncryptedVote').wrapped_obj
 
     if 'HTTP_X_FORWARDED_FOR' in request.META:
       # HTTP_X_FORWARDED_FOR sometimes have a comma delimited list of IP addresses
@@ -665,7 +678,7 @@ def one_election_cast_confirm(request, election):
 
     # prepare the vote to cast
     cast_vote_params = {
-      'vote' : vote,
+      param_name : vote,
       'voter' : voter,
       'vote_hash': vote_fingerprint,
       'cast_at': datetime.datetime.utcnow(),
@@ -730,7 +743,8 @@ def one_election_cast_confirm(request, election):
         'bad_voter_login': bad_voter_login})
       
   if request.method == "POST":
-    check_csrf(request)
+    if not election.is_quantum_safe:
+      check_csrf(request)
     
     # voting has not started or has ended
     if (not election.voting_has_started()) or election.voting_has_stopped():
@@ -756,7 +770,8 @@ def one_election_cast_confirm(request, election):
       status_update_message = status_update_message)
     
     # remove the vote from the store
-    del request.session['encrypted_vote']
+    if 'encrypted_vote' in request.session:
+      del request.session['encrypted_vote']
     
     return HttpResponseRedirect(settings.SECURE_URL_HOST + reverse(one_election_cast_done, args=[election.uuid]))
   
@@ -982,11 +997,18 @@ def one_election_copy(request, election):
     registration_starts_at = election.registration_starts_at,
     voting_starts_at = election.voting_starts_at,
     voting_ends_at = election.voting_ends_at,
-    cast_url = settings.SECURE_URL_HOST + reverse(one_election_cast, args=[new_uuid])
+    cast_url = settings.SECURE_URL_HOST + reverse(one_election_cast, args=[new_uuid]),
+    election_method = election.election_method,
   )
-  
 
-  new_election.generate_trustee(ELGAMAL_PARAMS)
+  if election.is_quantum_safe:
+    bb = BallotBox.get_by_election(election)
+    new_bb = BallotBox.setup_from_election(new_election, bb.return_code_server_url, bb.shuffle_server_url,
+                                           bb.auditors_urls)
+  else:
+    new_election.generate_trustee(ELGAMAL_PARAMS)
+
+  new_election.save()
   return HttpResponseRedirect(settings.SECURE_URL_HOST + reverse(url_names.election.ELECTION_VIEW, args=[new_election.uuid]))
 
 # changed from admin to view because 
@@ -1037,24 +1059,24 @@ def one_election_lbvs_register(request, election):
   """
   # TODO better error handling
   if not election.openreg or not election.is_quantum_safe or not election.frozen_at:
-        raise PermissionDenied
+        return {'error': 'registration is closed for this election'}
 
 
   user = get_user(request)
-  if not user:
-    raise PermissionDenied
-
   voter = Voter.get_by_election_and_user(election, user)
 
   if voter:
-    raise PermissionDenied
+    return {'error': 'already registered'}
+
+  voter_phone = json.loads(request.body)['voter_phone']
 
   voter = _register_voter(election, user)
-  lbvs_voter, vvk_serialized, vck_serialized, rct  = LbvsVoter.register(voter)
+  lbvs_voter, vvk_serialized, vck_serialized, rct  = LbvsVoter.register(voter, voter_phone)
 
+  # send public data to the return code server
   voter_registration = {
     'voter_uuid': lbvs_voter.uuid,
-    'voter_email': voter.voter_email,
+    'voter_phone_address': voter_phone,
     'vvk': vvk_serialized,
     'election_uuid': election.uuid,
   }
@@ -1062,8 +1084,14 @@ def one_election_lbvs_register(request, election):
   url = f"{BallotBox.get_by_election(election).return_code_server_url}/code/register"
   requests.post(url, json=voter_registration)
 
+  # send the rct to the voter phone
+  requests.post(voter_phone + "/phone/register", json={
+    'voter_uuid': lbvs_voter.uuid,
+    'rct': rct
+  })
+
   return {
-    'voter': lbvs_voter.toJSONDict(),
+    'voter_uuid': lbvs_voter.uuid,
     'vvk': vvk_serialized,
     'vck': vck_serialized,
     'rct': rct
@@ -1076,7 +1104,7 @@ def one_election_lbvs_instance(request, election):
   get lbvs instance
   """
   if not election.is_quantum_safe:
-    raise PermissionDenied
+    return JsonResponse({'error': 'election is not quantum safe'}, status=403)
 
   bb = BallotBox.get_by_election(election)
 
@@ -1210,7 +1238,10 @@ def combine_decryptions(request, election):
   if request.method == "POST":
     check_csrf(request)
 
-    election.combine_decryptions()
+    if election.is_quantum_safe:
+      election.verify_pqc_result()
+    else:
+      election.combine_decryptions()
     election.save()
 
     return HttpResponseRedirect(settings.SECURE_URL_HOST + reverse(url_names.election.ELECTION_VIEW, args=[election.uuid]))
@@ -1538,7 +1569,3 @@ def ballot_list(request, election):
 
   # we explicitly cast this to a short cast vote
   return [v.last_cast_vote().ld_object.short.toDict(complete=True) for v in voters]
-
-
-
-

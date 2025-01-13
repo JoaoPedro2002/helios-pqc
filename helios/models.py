@@ -12,11 +12,13 @@ import datetime
 import uuid
 
 import bleach
+from celery.worker.control import election
 from django.conf import settings
 from django.db import models, transaction
+from lbvs_lib.cleanup import clear_keys, clear_voter
 from lbvs_lib.return_code_table import ReturnCodeTable
 from lbvs_lib.scheme_algorithms import setup, register
-from lbvs_lib.serializers import serialize_pk, deserialize_pk, serialize_vvk, serialize_vck
+from lbvs_lib.serializers2 import serialize_pk, deserialize_pk, serialize_vvk, serialize_vck, serialize_ck, serialize_dk, set_repr
 from validate_email import validate_email
 
 from helios import datatypes
@@ -28,6 +30,8 @@ from helios_auth.models import User, AUTH_SYSTEMS
 from .crypto import algs
 from .crypto.elgamal import Cryptosystem
 from .crypto.utils import random, hash_b64
+
+set_repr("str")
 
 
 class HeliosModel(models.Model, datatypes.LDObjectContainer):
@@ -169,6 +173,8 @@ class Election(HeliosModel):
 
   @property
   def num_cast_votes(self):
+    if self.is_quantum_safe:
+      return self.voter_set.exclude(generic_vote=None).count()
     return self.voter_set.exclude(vote=None).count()
 
   @property
@@ -390,19 +396,20 @@ class Election(HeliosModel):
          'action': "add questions to the ballot"}
         )
 
-    trustees = Trustee.get_by_election(self)
-    if len(trustees) == 0:
-      issues.append({
-          'type': 'trustees',
-          'action': "add at least one trustee"
-          })
-
-    for t in trustees:
-      if t.public_key is None:
+    if not self.is_quantum_safe:
+      trustees = Trustee.get_by_election(self)
+      if len(trustees) == 0:
         issues.append({
-            'type': 'trustee keypairs',
-            'action': 'have trustee %s generate a keypair' % t.name
+            'type': 'trustees',
+            'action': "add at least one trustee"
             })
+
+      for t in trustees:
+        if t.public_key is None:
+          issues.append({
+              'type': 'trustee keypairs',
+              'action': 'have trustee %s generate a keypair' % t.name
+              })
 
     if self.voter_set.count() == 0 and not self.openreg:
       issues.append({
@@ -412,6 +419,12 @@ class Election(HeliosModel):
 
     return issues
 
+  def ready_for_verification_pqc(self):
+    if not self.is_quantum_safe:
+      return False
+    bb = BallotBox.get_by_election(self)
+    return bb.ready_for_verification
+
   def ready_for_tallying(self):
     return datetime.datetime.utcnow() >= self.tallying_starts_at
 
@@ -419,20 +432,39 @@ class Election(HeliosModel):
     """
     tally the election, assuming votes already verified
     """
-    tally = self.init_tally()
-    for voter in self.voter_set.exclude(vote=None):
-      tally.add_vote(voter.vote, verify_p=False)
+    if self.is_quantum_safe:
+      ballots = self.get_all_pqc_ballots()
+      bb = BallotBox.get_by_election(self)
+      bb.send_ballots_to_shuffler(ballots)
+    else:
+      tally = self.init_tally()
+      for voter in self.voter_set.exclude(vote=None):
+        tally.add_vote(voter.vote, verify_p=False)
+      self.encrypted_tally = tally
+      self.save()
 
-    self.encrypted_tally = tally
-    self.save()
+  def get_all_pqc_ballots(self, add_proof=False):
+    # order voters by cast_at
+    voters = self.voter_set.exclude(generic_vote=None).order_by('-cast_at')
+    ballots_per_question = [[] for _ in range(len(self.questions))]
+    for voter in voters:
+      for i, vote in enumerate(voter.generic_vote):
+        if add_proof:
+          ballots_per_question[i].append(vote)
+        else:
+          ballots_per_question[i].append(vote['ev'])
+    return ballots_per_question
 
   def ready_for_decryption(self):
-    return self.encrypted_tally is not None
+    return self.encrypted_tally is not None or self.ready_for_verification_pqc()
 
   def ready_for_decryption_combination(self):
     """
     do we have a tally from all trustees?
     """
+    if self.is_quantum_safe:
+      return self.ready_for_verification_pqc()
+
     for t in Trustee.get_by_election(self):
       if not t.decryption_factors:
         return False
@@ -461,6 +493,23 @@ class Election(HeliosModel):
 
     self.append_log(ElectionLog.DECRYPTIONS_COMBINED)
 
+    self.save()
+
+  def verify_pqc_result(self):
+    bb = BallotBox.get_by_election(self)
+    ballots = self.get_all_pqc_ballots(add_proof=True)
+    (dec_ballots, election_count), proof_result = bb.verify_result(ballots)
+
+    election_result = []
+    for i, result in enumerate(election_count):
+      result_as_list = list(map(lambda x: int(x), result.split(" ")[3:]))
+      answers_len = len(self.questions[i]['answers'])
+      for j in range(answers_len - len(result_as_list)):
+        result_as_list.append(0)
+      election_result.append(result_as_list)
+
+    self.result = election_result
+    self.append_log(ElectionLog.DECRYPTIONS_COMBINED)
     self.save()
 
   def generate_voters_hash(self):
@@ -546,15 +595,15 @@ class Election(HeliosModel):
       pk, dk, ck = setup()
       bb = BallotBox.get_by_election(self)
       bb.freeze(public_key=pk)
-      bb.send_keys(public_key=pk, decryption_key=dk, code_key=ck)
-
+      bb.send_keys(decryption_key=dk, code_key=ck)
+      clear_keys(ck, dk, pk)
     else:
       trustees = list(Trustee.get_by_election(self))
       combined_pk = trustees[0].public_key
       for t in trustees[1:]:
         combined_pk = combined_pk * t.public_key
 
-    self.public_key = combined_pk
+      self.public_key = combined_pk
 
     # log it
     self.append_log(ElectionLog.FROZEN)
@@ -851,6 +900,10 @@ class Voter(HeliosModel):
   # we keep a copy here for easy tallying
   vote = LDObjectField(type_hint = 'legacy/EncryptedVote', null=True)
   vote_hash = models.CharField(max_length = 100, null=True)
+
+  # if election is something besides the usual Helios election
+  generic_vote = models.JSONField(null=True)
+
   cast_at = models.DateTimeField(auto_now_add=False, null=True)
 
   class Meta:
@@ -1010,14 +1063,17 @@ class Voter(HeliosModel):
     # only store the vote if it's cast later than the current one
     if self.cast_at and cast_vote.cast_at < self.cast_at:
       return
-
-    self.vote = cast_vote.vote
+    if self.election.is_quantum_safe:
+      self.generic_vote = cast_vote.generic_vote
+    else:
+      self.vote = cast_vote.vote
     self.vote_hash = cast_vote.vote_hash
     self.cast_at = cast_vote.cast_at
     self.save()
 
   def last_cast_vote(self):
-    return CastVote(vote = self.vote, vote_hash = self.vote_hash, cast_at = self.cast_at, voter=self)
+    return CastVote(vote = self.vote, generic_vote = self.generic_vote,
+                    vote_hash = self.vote_hash, cast_at = self.cast_at, voter=self)
 
 
 class CastVote(HeliosModel):
@@ -1025,7 +1081,10 @@ class CastVote(HeliosModel):
   voter = models.ForeignKey(Voter, on_delete=models.CASCADE)
 
   # the actual encrypted vote
-  vote = LDObjectField(type_hint = 'legacy/EncryptedVote')
+  vote = LDObjectField(type_hint = 'legacy/EncryptedVote', null=True)
+
+  # if election is something besides the usual Helios election
+  generic_vote = models.JSONField(null=True)
 
   # cache the hash of the vote
   vote_hash = models.CharField(max_length=100)
@@ -1101,7 +1160,13 @@ class CastVote(HeliosModel):
     if self.is_quarantined:
       raise Exception("cast vote is quarantined, verification and storage is delayed.")
 
-    result = self.vote.verify(self.voter.election)
+    if self.voter.election.is_quantum_safe:
+      bb = BallotBox.get_by_election(self.voter.election)
+      lbvs_voter = LbvsVoter.get_by_voter(self.voter)
+      confirmation = bb.send_ballot_to_code_server(self)
+      result = confirmation['confirmation'] and confirmation['voter_uuid'] == lbvs_voter.uuid
+    else:
+      result = self.vote.verify(self.voter.election)
 
     if result:
       self.verified_at = datetime.datetime.utcnow()
@@ -1245,7 +1310,7 @@ class BallotBox(HeliosModel):
     shuffle_server_url = models.CharField(max_length=500, null=False)
     auditors_urls = JSONField(null=False)
 
-    prf_key = models.CharField(max_length=500, null=True)
+    ready_for_verification = models.BooleanField(default=False)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1268,6 +1333,8 @@ class BallotBox(HeliosModel):
         self.save()
 
     def send_keys(self, decryption_key, code_key):
+        dk = serialize_dk(decryption_key)
+        ck = serialize_ck(code_key)
         instance = self.get_election_instance()
         import requests
         for url in self.auditors_urls:
@@ -1276,14 +1343,54 @@ class BallotBox(HeliosModel):
             })
         requests.post(self.shuffle_server_url + "/shuffler/setup", json={
             "instance": instance,
-            'dk': decryption_key,
+            'dk': dk,
         })
-        resp = requests.post(self.return_code_server_url + "/code/setup", json={
+
+        requests.post(self.return_code_server_url + "/code/setup", json={
             "instance": instance,
-            'ck': code_key,
+            'ck': ck,
         })
-        self.prf_key = resp.json()["key"]
+
+    def send_ballot_to_code_server(self, cast_vote):
+        lbvs_voter = LbvsVoter.get_by_voter(cast_vote.voter)
+        voter_uuid = lbvs_voter.uuid
+        election_uuid = self.election.uuid
+
+        import requests
+        try:
+            return requests.post(self.return_code_server_url + "/code/casting", json={
+                "voter_uuid": voter_uuid,
+                "election_uuid": election_uuid,
+                "questions": cast_vote.generic_vote
+            }, timeout=300).json()
+        except requests.exceptions.Timeout:
+            return {"confirmation": False, "voter_id": voter_uuid}
+
+    def send_ballots_to_shuffler(self, ballots):
+        import requests
+        requests.post(self.shuffle_server_url + "/shuffler/counting", json={
+            "election_uuid": self.election.uuid,
+            "ballots": ballots
+        })
+        self.ready_for_verification = True
         self.save()
+
+
+    def verify_result(self, ballots):
+        import requests
+        try:
+            compare_ballots = requests.post(self.shuffle_server_url + "/auditor/verify_ballots", json={
+                "election_uuid": self.election.uuid,
+                "ballots_and_proofs": ballots
+            }).json()
+            if not compare_ballots["equal_ballots"]:
+                return None, False
+            verify_shuffle = requests.get(self.shuffle_server_url + "/auditor/verify_shuffle", params={
+                "election_uuid": self.election.uuid
+            }).json()
+            return (verify_shuffle["ballots"], verify_shuffle["election_count"]), verify_shuffle["result"]
+        except requests.exceptions.Timeout:
+            return None, False
 
     def get_election_instance(self) -> dict:
         return {
@@ -1294,7 +1401,6 @@ class BallotBox(HeliosModel):
             "ballot_box_url": settings.SECURE_URL_HOST,
             "ballot_box_uuid": self.uuid,
             "election_uuid": self.election.uuid,
-            # "prf_key": self.prf_key,
         }
 
     @classmethod
@@ -1308,31 +1414,33 @@ class BallotBox(HeliosModel):
 class LbvsVoter(HeliosModel):
   uuid = models.CharField(max_length=50, null=False)
   voter = models.ForeignKey(Voter, on_delete=models.CASCADE)
-  vote = JSONField(null=True)
-
+  voter_phone = models.CharField(max_length=250, null=True)
   vvk = JSONField(null=True)
 
   @classmethod
-  def register(cls, voter):
+  def register(cls, voter, phone):
     import requests
 
     ballot_box = BallotBox.get_by_election(voter.election)
-    prf_key = requests.get(ballot_box.return_code_server_url + "/code/key")
+    prf_key = requests.get(ballot_box.return_code_server_url + "/code/key", params={
+        "election_uuid": voter.election.uuid
+    }).json()
+    key = ReturnCodeTable.decode_key(prf_key["key"])
     pk = deserialize_pk(ballot_box.public_key)
 
     vvk, vck, f = register(pk)
     vvk_serialized = serialize_vvk(vvk)
     vck_serialized = serialize_vck(vck)
 
-    rct = [ReturnCodeTable.compute_table(prf_key["key"], vck[0], question, b64=True)
+    rct = [ReturnCodeTable.compute_table(key, vck[0], question, b64=True)
            for question in voter.election.questions]
 
     uuid_voter = str(uuid.uuid4())
-    lbvs_voter = LbvsVoter(uuid=uuid_voter, voter=voter, vote=None, vvk=vvk_serialized)
+    lbvs_voter = LbvsVoter(uuid=uuid_voter, voter=voter, vvk=vvk_serialized, voter_phone=phone)
 
     lbvs_voter.save()
 
-    # TODO cleanup
+    clear_voter((vvk, vck, f))
     return lbvs_voter, vvk_serialized, vck_serialized, rct
 
   @classmethod

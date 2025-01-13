@@ -62,3 +62,6 @@ ELECTION_VOTER_DELETE="election@voter@delete"
 ELECTION_BALLOTS_LIST="election@ballots@list"
 ELECTION_BALLOTS_VOTER="election@ballots@voter"
 ELECTION_BALLOTS_VOTER_LAST="election@ballots@voter@last"
+
+
+ELECTION_CAST_PQC="election@cast-pqc"

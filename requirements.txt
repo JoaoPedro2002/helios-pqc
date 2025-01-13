@@ -27,7 +27,5 @@ rollbar==1.0.0
 django-auth-ldap==4.8.0
 python-ldap==3.4.4
 
-# locally installed
-lbvs-lib
 requests
 httplib2~=0.22.0
