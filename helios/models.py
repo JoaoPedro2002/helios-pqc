@@ -1379,13 +1379,13 @@ class BallotBox(HeliosModel):
     def verify_result(self, ballots):
         import requests
         try:
-            compare_ballots = requests.post(self.shuffle_server_url + "/auditor/verify_ballots", json={
+            compare_ballots = requests.post(self.auditors_urls[0] + "/auditor/verify_ballots", json={
                 "election_uuid": self.election.uuid,
                 "ballots_and_proofs": ballots
             }).json()
             if not compare_ballots["equal_ballots"]:
                 return None, False
-            verify_shuffle = requests.get(self.shuffle_server_url + "/auditor/verify_shuffle", params={
+            verify_shuffle = requests.get(self.auditors_urls[0] + "/auditor/verify_shuffle", params={
                 "election_uuid": self.election.uuid
             }).json()
             return (verify_shuffle["ballots"], verify_shuffle["election_count"]), verify_shuffle["result"]
